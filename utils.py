@@ -86,11 +86,11 @@ def add_logging_and_checkpoint_saving(trainer, evaluator, metrics, model, optimi
             tb_logger.writer.add_scalar(name, engine.state.metrics[name], trainer.state.iteration)
 
     # Add checkpoint saving after each epoch - take care of distributed encapsulation ('getattr()')
-    checkpoint_handler = ModelCheckpoint(tb_logger.writer.log_dir, 'checkpoint', save_interval=1, n_saved=3)
+    checkpoint_handler = ModelCheckpoint(tb_logger.writer.logdir, 'checkpoint', save_interval=1, n_saved=3)
     trainer.add_event_handler(Events.EPOCH_COMPLETED, checkpoint_handler, {'mymodel': getattr(model, 'module', model)})
 
     # Save training configuration
-    torch.save(args, os.path.join(tb_logger.writer.log_dir, CONFIG_NAME))
+    torch.save(args, os.path.join(tb_logger.writer.logdir, CONFIG_NAME))
 
     return checkpoint_handler, tb_logger
 
