@@ -7,7 +7,7 @@ from argparse import ArgumentParser
 from pprint import pformat
 
 import torch
-from torch.nn.parallel import DistributedDataParallel
+from torch.nn.parallel import DistributedDataParallel, DataParallel
 from torch.optim import Adam
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -97,6 +97,8 @@ def train():
     # Prepare model for distributed training if needed
     if args.distributed:
         model = DistributedDataParallel(model, device_ids=[args.local_rank], output_device=args.local_rank)
+    else:
+        model = DataParallel(model)
 
     logger.info("Prepare datasets")
     train_loader, val_loader, train_sampler, valid_sampler, train_num_words, valid_num_words = get_data_loaders(args, tokenizer)
@@ -120,14 +122,13 @@ def train():
         inputs, labels = mask_tokens(inputs) if args.mlm else (inputs, inputs)  # Prepare masked input/labels if we use masked LM
         logits, loss = model(inputs, labels=labels)
         loss = loss / args.gradient_accumulation_steps
-        loss.backward()
+        loss.mean().backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
         if engine.state.iteration % args.gradient_accumulation_steps == 0:
             optimizer.step()
             optimizer.zero_grad()
-        return loss.item()
+        return loss.mean().item()
     trainer = Engine(update)
-
     # Evaluation function and evaluator (evaluator output is the input of the metrics)
     def inference(engine, batch):
         model.eval()
@@ -139,12 +140,12 @@ def train():
             shift_labels = labels[1:] if not args.mlm else labels
             return shift_logits.view(-1, logits.size(-1)), shift_labels.view(-1)
     evaluator = Engine(inference)
-
     # Attach evaluation to trainer: we evaluate at the end of each epoch and every 'eval_every' iterations if needed
     trainer.add_event_handler(Events.EPOCH_COMPLETED, lambda _: evaluator.run(val_loader))
     if args.eval_every > 0:
         trainer.add_event_handler(Events.ITERATION_COMPLETED,
                 lambda engine: evaluator.run(val_loader) if engine.state.iteration % args.eval_every == 0 else None)
+
     if args.n_epochs < 1:
         trainer.add_event_handler(Events.COMPLETED, lambda _: evaluator.run(val_loader))
 
@@ -152,14 +153,14 @@ def train():
     if args.distributed:
         trainer.add_event_handler(Events.EPOCH_STARTED, lambda engine: train_sampler.set_epoch(engine.state.epoch))
         evaluator.add_event_handler(Events.EPOCH_STARTED, lambda engine: valid_sampler.set_epoch(engine.state.epoch))
-
     # Learning rate schedule: linearly warm-up to lr and then decrease the learning rate to zero with cosine schedule
     cos_scheduler = CosineAnnealingScheduler(optimizer, 'lr', args.lr, 0.0, len(train_loader) * args.n_epochs)
-    scheduler = create_lr_scheduler_with_warmup(cos_scheduler, 0.0, args.lr, args.n_warmup)
+    scheduler = create_lr_scheduler_with_warmup(cos_scheduler, 0.0, args.n_warmup, args.lr)
     trainer.add_event_handler(Events.ITERATION_STARTED, scheduler)
 
     # Prepare metrics - note how we average distributed metrics using average_distributed_scalar
-    metrics = {"nll": Loss(torch.nn.CrossEntropyLoss(ignore_index=-1))}
+    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-1)
+    metrics = {"nll": Loss(loss_fn)}
     metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args)})
     metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
     # Let's convert sub-word perplexities in word perplexities. If you need details: http://sjmielke.com/comparing-perplexities.htm
@@ -173,6 +174,7 @@ def train():
 
     # Run the training
     trainer.run(train_loader, max_epochs=args.n_epochs)
+
 
     # On the main process: close tensorboard logger and rename the last checkpoint for easy re-loading
     if args.local_rank in [-1, 0] and args.n_epochs > 0:
