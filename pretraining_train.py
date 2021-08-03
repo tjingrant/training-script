@@ -27,7 +27,7 @@ def get_data_loaders(args, tokenizer):
     datasets = get_and_tokenize_dataset(tokenizer, args.dataset_path, args.dataset_cache)
 
     logger.info("Convert to Tensor and reshape in blocks of the transformer's input length")
-    for split_name in ['train', 'valid']:
+    for split_name in ['train', 'valid', 'test']:
         tensor = torch.tensor(datasets[split_name], dtype=torch.long)
         num_sequences = (tensor.size(0) // args.num_max_positions) * args.num_max_positions
         datasets[split_name] = tensor.narrow(0, 0, num_sequences).view(-1, args.num_max_positions)
@@ -35,12 +35,16 @@ def get_data_loaders(args, tokenizer):
     logger.info("Build train and validation dataloaders")
     train_sampler = torch.utils.data.distributed.DistributedSampler(datasets['train']) if args.distributed else None
     valid_sampler = torch.utils.data.distributed.DistributedSampler(datasets['valid']) if args.distributed else None
+    test_sampler = torch.utils.data.distributed.DistributedSampler(datasets['test']) if args.distributed else None
     train_loader = DataLoader(datasets['train'], sampler=train_sampler, batch_size=args.train_batch_size, shuffle=(not args.distributed))
     valid_loader = DataLoader(datasets['valid'], sampler=valid_sampler, batch_size=args.valid_batch_size, shuffle=False)
+    test_loader = DataLoader(datasets['test'], sampler=test_sampler, batch_size=args.valid_batch_size, shuffle=False)
 
     logger.info("Train dataset (Batch, Seq length): {}".format(datasets['train'].shape))
     logger.info("Valid dataset (Batch, Seq length): {}".format(datasets['valid'].shape))
-    return train_loader, valid_loader, train_sampler, valid_sampler, datasets['train_num_words'], datasets['valid_num_words']
+    logger.info("Test dataset (Batch, Seq Length): {}".format(datasets['test'].shape))
+
+    return train_loader, valid_loader, test_loader, train_sampler, valid_sampler, test_sampler, datasets['train_num_words'], datasets['valid_num_words'], datasets['test_num_words']
 
 
 def train():
@@ -101,7 +105,7 @@ def train():
         model = DataParallel(model)
 
     logger.info("Prepare datasets")
-    train_loader, val_loader, train_sampler, valid_sampler, train_num_words, valid_num_words = get_data_loaders(args, tokenizer)
+    train_loader, val_loader, test_loader, train_sampler, valid_sampler, test_sampler, train_num_words, valid_num_words, test_num_words = get_data_loaders(args, tokenizer)
 
     # Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original
     def mask_tokens(inputs):
@@ -139,12 +143,16 @@ def train():
             shift_logits = logits[:-1] if not args.mlm else logits
             shift_labels = labels[1:] if not args.mlm else labels
             return shift_logits.view(-1, logits.size(-1)), shift_labels.view(-1)
-    evaluator = Engine(inference)
+    val_evaluator = Engine(inference)
+    test_evaluator = Engine(inference)
     # Attach evaluation to trainer: we evaluate at the end of each epoch and every 'eval_every' iterations if needed
-    trainer.add_event_handler(Events.EPOCH_COMPLETED, lambda _: evaluator.run(val_loader))
+    trainer.add_event_handler(Events.EPOCH_COMPLETED, lambda _: val_evaluator.run(val_loader))
+    trainer.add_event_handler(Events.EPOCH_COMPLETED, lambda _: test_evaluator.run(test_loader))
     if args.eval_every > 0:
         trainer.add_event_handler(Events.ITERATION_COMPLETED,
-                lambda engine: evaluator.run(val_loader) if engine.state.iteration % args.eval_every == 0 else None)
+                lambda engine: val_evaluator.run(val_loader) if engine.state.iteration % args.eval_every == 0 else None)
+        trainer.add_event_handler(Events.ITERATION_COMPLETED,
+                lambda engine: test_evaluator.run(test_loader) if engine.state.iteration % args.eval_every == 0 else None)
 
     if args.n_epochs < 1:
         trainer.add_event_handler(Events.COMPLETED, lambda _: evaluator.run(val_loader))
@@ -159,18 +167,26 @@ def train():
     trainer.add_event_handler(Events.ITERATION_STARTED, scheduler)
 
     # Prepare metrics - note how we average distributed metrics using average_distributed_scalar
-    loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-1)
-    metrics = {"nll": Loss(loss_fn)}
-    metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, metrics["nll"], args)})
-    metrics["average_ppl"] = MetricsLambda(math.exp, metrics["average_nll"])
+    val_loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-1)
+    valid_metrics = {"nll": Loss(val_loss_fn)}
+    valid_metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, valid_metrics["nll"], args)})
+    valid_metrics["average_ppl"] = MetricsLambda(math.exp, valid_metrics["average_nll"])
     # Let's convert sub-word perplexities in word perplexities. If you need details: http://sjmielke.com/comparing-perplexities.htm
-    metrics["average_word_ppl"] = MetricsLambda(lambda x: math.exp(x * val_loader.dataset.numel() / valid_num_words), metrics["average_nll"])
-    for name, metric in metrics.items():
-        metric.attach(evaluator, name)
+    valid_metrics["average_valid_word_ppl"] = MetricsLambda(lambda x: math.exp(x * val_loader.dataset.numel() / valid_num_words), valid_metrics["average_nll"])
+    for name, metric in valid_metrics.items():
+        metric.attach(val_evaluator, name)
+
+    test_loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-1)
+    test_metrics = {"nll": Loss(test_loss_fn)}
+    test_metrics.update({"average_nll": MetricsLambda(average_distributed_scalar, test_metrics["nll"], args)})
+    test_metrics["average_ppl"] = MetricsLambda(math.exp, test_metrics["average_nll"])
+    test_metrics["average_test_word_ppl"] = MetricsLambda(lambda x: math.exp(x * test_loader.dataset.numel() / test_num_words), test_metrics["average_nll"])
+    for name, metric in test_metrics.items():
+        metric.attach(test_evaluator, name)
 
     # On the main process: add progress bar, tensorboard, checkpoints and save model and configuration before we start to train
     if args.local_rank in [-1, 0]:
-        checkpoint_handler, tb_logger = add_logging_and_checkpoint_saving(trainer, evaluator, metrics, model, optimizer, args)
+        checkpoint_handler, tb_logger = add_logging_and_checkpoint_saving(trainer, val_evaluator, test_evaluator, valid_metrics, test_metrics, model, optimizer, args)
 
     # Run the training
     trainer.run(train_loader, max_epochs=args.n_epochs)

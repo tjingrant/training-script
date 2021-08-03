@@ -19,7 +19,8 @@ DATASETS_URL = {
     'wikitext-2':   {'train': "https://s3.amazonaws.com/datasets.huggingface.co/wikitext-2/train.txt",
                      'valid': "https://s3.amazonaws.com/datasets.huggingface.co/wikitext-2/valid.txt"},
     'wikitext-103': {'train': "https://s3.amazonaws.com/datasets.huggingface.co/wikitext-103/wiki.train.tokens",
-                     'valid': "https://s3.amazonaws.com/datasets.huggingface.co/wikitext-103/wiki.valid.tokens"},
+                     'valid': "https://s3.amazonaws.com/datasets.huggingface.co/wikitext-103/wiki.valid.tokens",
+                     'test': "https://s3.amazonaws.com/datasets.huggingface.co/wikitext-103/wiki.test.tokens"},
     'simplebooks-2-raw': {'train': "https://s3.amazonaws.com/datasets.huggingface.co/simplebooks-2-raw/train.txt",
                           'valid': "https://s3.amazonaws.com/datasets.huggingface.co/simplebooks-2-raw/valid.txt"},
     'simplebooks-92-raw': {'train': "https://s3.amazonaws.com/datasets.huggingface.co/simplebooks-92-raw/train.txt",
@@ -66,13 +67,14 @@ def pad_dataset(dataset, padding=0, to_left=True):
     return dataset
 
 
-def add_logging_and_checkpoint_saving(trainer, evaluator, metrics, model, optimizer, args, prefix=""):
+def add_logging_and_checkpoint_saving(trainer, val_evaluator, test_evaluator, val_metrics, test_metrics, model, optimizer, args, prefix=""):
     """ Add to training engine tensorboard logging, progress bar with average loss, checkpoint saving and save training config. """
     # Add progress bar with average loss
     RunningAverage(output_transform=lambda x: x).attach(trainer, prefix + "loss")
     pbar = ProgressBar(persist=True)
     pbar.attach(trainer, metric_names=[prefix + "loss"])
-    evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Validation: %s" % pformat(evaluator.state.metrics)))
+    val_evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Validation: %s" % pformat(val_evaluator.state.metrics)))
+    test_evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Test: %s" % pformat(test_evaluator.state.metrics)))
 
     # Add tensorboard logging with training and evaluation metrics
     tb_logger = TensorboardLogger(log_dir=None)
@@ -80,9 +82,9 @@ def add_logging_and_checkpoint_saving(trainer, evaluator, metrics, model, optimi
                               event_name=Events.ITERATION_COMPLETED)
     tb_logger.attach(trainer, log_handler=OptimizerParamsHandler(optimizer),
                               event_name=Events.ITERATION_STARTED)
-    @evaluator.on(Events.COMPLETED)
+    @val_evaluator.on(Events.COMPLETED)
     def tb_log_metrics(engine):
-        for name in metrics.keys():
+        for name in val_metrics.keys():
             tb_logger.writer.add_scalar(name, engine.state.metrics[name], trainer.state.iteration)
 
     # Add checkpoint saving after each epoch - take care of distributed encapsulation ('getattr()')
@@ -141,7 +143,7 @@ def get_and_tokenize_dataset(tokenizer, dataset_dir='wikitext-103', dataset_cach
         encoded_dataset = encode(dataset)
 
         # Add labels if needed, or if we are doing language modeling, add number of words to get word-level ppl and gather in one list
-        for split_name in ['train', 'valid']:
+        for split_name in ['train', 'valid', 'test']:
             if with_labels:
                 encoded_dataset[split_name + '_labels'] = labels[split_name]
             else:
