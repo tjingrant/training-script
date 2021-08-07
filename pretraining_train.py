@@ -19,6 +19,7 @@ from pytorch_pretrained_bert import BertTokenizer
 
 from pretraining_model import TransformerWithLMHead
 from utils import get_and_tokenize_dataset, average_distributed_scalar, add_logging_and_checkpoint_saving, WEIGHTS_NAME
+from torch.cuda.amp import autocast, GradScaler
 
 logger = logging.getLogger(__file__)
 
@@ -106,6 +107,7 @@ def train():
 
     logger.info("Prepare datasets")
     train_loader, val_loader, test_loader, train_sampler, valid_sampler, test_sampler, train_num_words, valid_num_words, test_num_words = get_data_loaders(args, tokenizer)
+    scaler = GradScaler()
 
     # Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original
     def mask_tokens(inputs):
@@ -124,13 +126,17 @@ def train():
         model.train()
         inputs = batch.transpose(0, 1).contiguous().to(args.device)  # to shape [seq length, batch]
         inputs, labels = mask_tokens(inputs) if args.mlm else (inputs, inputs)  # Prepare masked input/labels if we use masked LM
-        logits, loss = model(inputs, labels=labels)
-        loss = loss / args.gradient_accumulation_steps
-        loss.mean().backward()
+        with autocast():
+            logits, loss = model(inputs, labels=labels)
+            loss = loss / args.gradient_accumulation_steps
+        scaler.scale(loss.mean()).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_norm)
         if engine.state.iteration % args.gradient_accumulation_steps == 0:
-            optimizer.step()
+            scaler.step(optimizer)
             optimizer.zero_grad()
+            scaler.update()
+
         return loss.mean().item()
     trainer = Engine(update)
     # Evaluation function and evaluator (evaluator output is the input of the metrics)
