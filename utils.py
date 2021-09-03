@@ -70,31 +70,31 @@ def pad_dataset(dataset, padding=0, to_left=True):
 def add_logging_and_checkpoint_saving(trainer, val_evaluator, test_evaluator, val_metrics, test_metrics, model, optimizer, args, prefix=""):
     """ Add to training engine tensorboard logging, progress bar with average loss, checkpoint saving and save training config. """
     # Add progress bar with average loss
-    RunningAverage(output_transform=lambda x: x).attach(trainer, prefix + "loss")
-    pbar = ProgressBar(persist=True)
-    pbar.attach(trainer, metric_names=[prefix + "loss"])
-    val_evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Validation: %s" % pformat(val_evaluator.state.metrics)))
-    test_evaluator.add_event_handler(Events.COMPLETED, lambda _: pbar.log_message("Test: %s" % pformat(test_evaluator.state.metrics)))
+    # RunningAverage(output_transform=lambda x: x).attach(trainer, prefix + "loss")
+    # pbar = ProgressBar(persist=True)
+    # pbar.attach(trainer, metric_names=[prefix + "loss"])
+    val_evaluator.add_event_handler(Events.COMPLETED, lambda _: print("Validation: %s" % pformat(val_evaluator.state.metrics)))
+    test_evaluator.add_event_handler(Events.COMPLETED, lambda _: print("Test: %s" % pformat(test_evaluator.state.metrics)))
 
     # Add tensorboard logging with training and evaluation metrics
-    tb_logger = TensorboardLogger(log_dir=None)
-    tb_logger.attach(trainer, log_handler=OutputHandler(tag="training", metric_names=[prefix + "loss"]),
-                              event_name=Events.ITERATION_COMPLETED)
-    tb_logger.attach(trainer, log_handler=OptimizerParamsHandler(optimizer),
-                              event_name=Events.ITERATION_STARTED)
-    @val_evaluator.on(Events.COMPLETED)
-    def tb_log_metrics(engine):
-        for name in val_metrics.keys():
-            tb_logger.writer.add_scalar(name, engine.state.metrics[name], trainer.state.iteration)
+    # tb_logger = TensorboardLogger(log_dir=None)
+    # tb_logger.attach(trainer, log_handler=OutputHandler(tag="training", metric_names=[prefix + "loss"]),
+    #                          event_name=Events.ITERATION_COMPLETED)
+    # tb_logger.attach(trainer, log_handler=OptimizerParamsHandler(optimizer),
+    #                          event_name=Events.ITERATION_STARTED)
+    # @val_evaluator.on(Events.COMPLETED)
+    # def tb_log_metrics(engine):
+    #     for name in val_metrics.keys():
+    #         tb_logger.writer.add_scalar(name, engine.state.metrics[name], trainer.state.iteration)
 
     # Add checkpoint saving after each epoch - take care of distributed encapsulation ('getattr()')
-    checkpoint_handler = ModelCheckpoint(tb_logger.writer.logdir, 'checkpoint', save_interval=1, n_saved=3)
-    trainer.add_event_handler(Events.EPOCH_COMPLETED, checkpoint_handler, {'mymodel': getattr(model, 'module', model)})
+    # checkpoint_handler = ModelCheckpoint(tb_logger.writer.logdir, 'checkpoint', save_interval=1, n_saved=3)
+    # trainer.add_event_handler(Events.EPOCH_COMPLETED, checkpoint_handler, {'mymodel': getattr(model, 'module', model)})
 
     # Save training configuration
-    torch.save(args, os.path.join(tb_logger.writer.logdir, CONFIG_NAME))
+    # torch.save(args, os.path.join(tb_logger.writer.logdir, CONFIG_NAME))
 
-    return checkpoint_handler, tb_logger
+    # return checkpoint_handler, tb_logger
 
 
 def get_and_tokenize_dataset(tokenizer, dataset_dir='wikitext-103', dataset_cache=None, with_labels=False):
